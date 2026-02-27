@@ -1,0 +1,246 @@
+def global_median_pooling(x):
+    median_pooled = torch.median(x.view(x.size(0), x.size(1), -1), dim=2)[0]
+    median_pooled = median_pooled.view(x.size(0), x.size(1), 1, 1)
+    return median_pooled
+
+class ChannelAttention(nn.Module):
+    def __init__(self, input_channels, internal_neurons):
+        super(ChannelAttention, self).__init__()
+        self.fc1 = nn.Conv2d(in_channels=input_channels, out_channels=internal_neurons, 
+                           kernel_size=1, stride=1, bias=True)
+        self.fc2 = nn.Conv2d(in_channels=internal_neurons, out_channels=input_channels, 
+                           kernel_size=1, stride=1, bias=True)
+        self.input_channels = input_channels
+
+    def forward(self, inputs):
+        avg_pool = F.adaptive_avg_pool2d(inputs, output_size=(1, 1))
+        max_pool = F.adaptive_max_pool2d(inputs, output_size=(1, 1))
+        median_pool = global_median_pooling(inputs)
+        avg_out = self.fc2(F.relu(self.fc1(avg_pool), inplace=True))
+        avg_out = torch.sigmoid(avg_out)
+        max_out = self.fc2(F.relu(self.fc1(max_pool), inplace=True))
+        max_out = torch.sigmoid(max_out)
+        median_out = self.fc2(F.relu(self.fc1(median_pool), inplace=True))
+        median_out = torch.sigmoid(median_out)
+        out = avg_out + max_out + median_out
+        return out
+
+class Channel(nn.Module):
+    def __init__(self, in_channels, out_channels, channel_attention_reduce=4):
+        super(MECS, self).__init__()
+        self.C = in_channels
+        self.O = out_channels
+        assert in_channels == out_channels, "Input and output channels must be the same"
+        
+        self.channel_attention = ChannelAttention(
+            input_channels=in_channels,
+            internal_neurons=in_channels // channel_attention_reduce
+        )
+        self.depth_conv = nn.Conv2d(
+            in_channels, in_channels, kernel_size=5, padding=2, groups=in_channels
+        )
+
+        self.pointwise_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1, padding=0)
+        self.act = nn.GELU()
+
+    def forward(self, inputs):
+        inputs = self.pointwise_conv(inputs)
+        inputs = self.act(inputs)
+        channel_att_vec = self.channel_attention(inputs)
+        inputs = channel_att_vec * inputs
+        conv_out = self.depth_conv(inputs)
+        out = self.pointwise_conv(conv_out)
+        return out
+
+class DWT2d(nn.Module):
+    def __init__(self, wave='haar'):
+        super(DWT2d, self).__init__()
+        self.wave = wave
+        if wave == 'haar':
+            ll = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32) / 4.0
+            lh = torch.tensor([[-1, 1], [-1, 1]], dtype=torch.float32) / 4.0 
+            hl = torch.tensor([[-1, -1], [1, 1]], dtype=torch.float32) / 4.0 
+            hh = torch.tensor([[1, -1], [-1, 1]], dtype=torch.float32) / 4.0 
+            
+            self.register_buffer('ll_filter', ll.view(1, 1, 2, 2))
+            self.register_buffer('lh_filter', lh.view(1, 1, 2, 2))
+            self.register_buffer('hl_filter', hl.view(1, 1, 2, 2))
+            self.register_buffer('hh_filter', hh.view(1, 1, 2, 2))
+    
+    def forward(self, x):
+        batch_size, channels, height, width = x.shape
+
+        if height % 2 != 0 or width % 2 != 0:
+            pad_h = (2 - height % 2) % 2
+            pad_w = (2 - width % 2) % 2
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='reflect')
+            height = height + pad_h
+            width = width + pad_w
+        subbands = []
+        
+        for i in range(channels):
+            channel_data = x[:, i:i+1, :, :]
+
+            ll = F.conv2d(channel_data, self.ll_filter, stride=2, padding=0)
+            lh = F.conv2d(channel_data, self.lh_filter, stride=2, padding=0)
+            hl = F.conv2d(channel_data, self.hl_filter, stride=2, padding=0)
+            hh = F.conv2d(channel_data, self.hh_filter, stride=2, padding=0)
+
+            subband = torch.cat([ll, lh, hl, hh], dim=1)
+            subbands.append(subband)
+
+        output = torch.cat(subbands, dim=1)
+        return output
+
+class IDWT2d(nn.Module):
+    def __init__(self, wave='haar'):
+        super(IDWT2d, self).__init__()
+        self.wave = wave
+        
+        if wave == 'haar':
+            ll = torch.tensor([[1, 1], [1, 1]], dtype=torch.float32)
+            lh = torch.tensor([[1, -1], [1, -1]], dtype=torch.float32)
+            hl = torch.tensor([[1, 1], [-1, -1]], dtype=torch.float32)
+            hh = torch.tensor([[1, -1], [-1, 1]], dtype=torch.float32)
+            
+            self.register_buffer('ll_filter', ll.view(1, 1, 2, 2))
+            self.register_buffer('lh_filter', lh.view(1, 1, 2, 2))
+            self.register_buffer('hl_filter', hl.view(1, 1, 2, 2))
+            self.register_buffer('hh_filter', hh.view(1, 1, 2, 2))
+    
+    def forward(self, x):
+        batch_size, channels, height, width = x.shape
+        assert channels % 4 == 0, "Channels must be divisible by 4"
+        
+        original_channels = channels // 4
+        outputs = []
+        
+        for i in range(original_channels):
+            base_idx = i * 4
+            ll = x[:, base_idx:base_idx+1, :, :]
+            lh = x[:, base_idx+1:base_idx+2, :, :]
+            hl = x[:, base_idx+2:base_idx+3, :, :]
+            hh = x[:, base_idx+3:base_idx+4, :, :]
+            ll_up = F.conv_transpose2d(ll, self.ll_filter, stride=2, padding=0)
+            lh_up = F.conv_transpose2d(lh, self.lh_filter, stride=2, padding=0)
+            hl_up = F.conv_transpose2d(hl, self.hl_filter, stride=2, padding=0)
+            hh_up = F.conv_transpose2d(hh, self.hh_filter, stride=2, padding=0)
+            reconstructed = ll_up + lh_up + hl_up + hh_up
+            outputs.append(reconstructed)
+        output = torch.cat(outputs, dim=1)
+        return output
+
+class FrequencyDomain(nn.Module):
+    def __init__(self, channels, reduction_ratio=16):
+        super(DWTEnhancementBlock, self).__init__()
+        self.channels = channels
+        self.dwt = DWT2d(wave='haar')
+        self.idwt = IDWT2d(wave='haar')
+        self.ll_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        self.lh_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        self.hl_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+        self.channel_attention = ChannelAttention(
+            input_channels=channels * 4,
+            internal_neurons=channels * 4 // reduction_ratio
+        )
+        self.fusion_conv = nn.Sequential(
+            nn.Conv2d(channels * 4, channels * 4, kernel_size=1),
+            nn.BatchNorm2d(channels * 4),
+            nn.ReLU(inplace=True)
+        )
+        self.residual = nn.Identity()
+        self.idwt_adjust = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(channels),
+            nn.ReLU(inplace=True)
+        )
+    
+    def forward(self, x):
+        residual = self.residual(x)
+        dwt_out = self.dwt(x)  # [B, C*4, H//2, W//2]
+        
+        batch_size, channels, height, width = dwt_out.shape
+        original_channels = channels // 4
+        ll = dwt_out[:, :original_channels, :, :] 
+        lh = dwt_out[:, original_channels:original_channels*2, :, :]
+        hl = dwt_out[:, original_channels*2:original_channels*3, :, :]
+        hh = dwt_out[:, original_channels*3:, :, :]
+        ll_enhanced = self.ll_conv(ll)
+        lh_enhanced = self.lh_conv(lh)
+        hl_enhanced = self.hl_conv(hl)
+        hh_enhanced = hh
+        combined = torch.cat([ll_enhanced, lh_enhanced, hl_enhanced, hh_enhanced], dim=1)
+        channel_att = self.channel_attention(combined)
+        combined = combined * channel_att
+        combined = self.fusion_conv(combined)
+        enhanced_dwt = self.idwt(combined)
+        enhanced_dwt = self.idwt_adjust(enhanced_dwt)
+        output = enhanced_dwt + residual  
+        return output
+        
+class FeedForwardNetwork(nn.Module):
+    def __init__(self, channels, expansion_ratio=2, dropout=0.1):
+        super(FeedForwardNetwork, self).__init__()
+        hidden_channels = int(channels * expansion_ratio)
+        
+        self.ffn = nn.Sequential(
+            nn.Conv2d(channels, hidden_channels, kernel_size=1),
+            nn.BatchNorm2d(hidden_channels),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1),
+            nn.BatchNorm2d(channels),
+            nn.Dropout(dropout)
+        )
+    
+    def forward(self, x):
+        return self.ffn(x)
+
+class BEVFeatureEnhancer(nn.Module):
+    def __init__(self, in_channels, out_channels=None, channel_attention_reduce=4,
+                 ffn_expansion_ratio=2, ffn_dropout=0.1):
+        super(BEVFeatureEnhancer, self).__init__()
+        
+        if out_channels is None:
+            out_channels = in_channels      
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.mecs_branch = Channel(in_channels, in_channels, channel_attention_reduce)
+        self.dwt_branch = FrequencyDomain(in_channels)
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels * 2, out_channels, kernel_size=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+        if in_channels != out_channels:
+            self.residual = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+        else:
+            self.residual = nn.Identity()
+        self.ffn = FeedForwardNetwork(
+            out_channels, 
+            expansion_ratio=ffn_expansion_ratio,
+            dropout=ffn_dropout
+        )
+    
+    def forward(self, x):
+        residual = self.residual(x)
+        mecs_out = self.mecs_branch(x)
+        dwt_out = self.dwt_branch(x)
+        combined = torch.cat([mecs_out, dwt_out], dim=1)
+        fused = self.fusion(combined)
+        output = fused + residual
+        output = output + self.ffn(output)
+        
+        return output
